@@ -1,157 +1,301 @@
-
 from __future__ import annotations
+import asyncio, time, math, random
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, Any
+from typing import Dict, Any, List, Optional, Tuple, Callable, Iterable
+import aiohttp
 import pandas as pd
 import numpy as np
+from dateutil import tz
+
+# ---------- Provider Adapters ----------
 
 @dataclass
-class PreprocessConfig:
-    date_col: str = "date"
-    price_col: str = "close"
-    index_utc: bool = False
-    missing_strategy: str = "ffill_bfill"      # 'ffill_bfill' | 'interpolate_time' | 'none'
-    outlier_strategy: str = "iqr"              # 'iqr' | 'mad' | 'zscore' | 'none'
-    outlier_threshold: float = 3.0             # For zscore/MAD; for IQR it's the k-multiplier
-    normalize_strategy: str = "zscore"         # 'zscore' | 'minmax' | 'robust' | 'none'
-    train_end: Optional[pd.Timestamp] = None   # Fit scalers up to this timestamp (inclusive)
+class ProviderConfig:
+    name: str
+    base_url: str
+    concurrency: int = 5                # Max in-flight requests to this provider
+    rpm: Optional[int] = None           # Rate limit: requests per minute (AlphaVantage e.g. 5/min free)
+    timeout_s: float = 15.0
+    headers: Dict[str, str] = field(default_factory=dict)
+    params: Dict[str, str] = field(default_factory=dict)
 
-@dataclass
-class FinancePreprocessor:
-    config: PreprocessConfig
-    fitted_: bool = field(default=False, init=False)
-    norm_params_: Dict[str, Any] = field(default_factory=dict, init=False)
+class ProviderAdapter:
+    """
+    Each adapter must implement:
+        build_url_and_params(ticker: str) -> (url, params)
+        parse(json: dict) -> pd.DataFrame with columns: ['ticker','date','open','high','low','close','volume','provider']
+    """
+    def __init__(self, cfg: ProviderConfig):
+        self.cfg = cfg
 
-    def _coerce_datetime_index(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        if self.config.date_col in df.columns:
-            df[self.config.date_col] = pd.to_datetime(df[self.config.date_col], utc=self.config.index_utc)
-            df = df.sort_values(self.config.date_col).set_index(self.config.date_col)
-        elif not isinstance(df.index, pd.DatetimeIndex):
-            raise ValueError("DataFrame must have a datetime index or a date_col")
-        else:
-            if self.config.index_utc:
-                df.index = df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
-            df = df.sort_index()
+    def build_url_and_params(self, ticker: str) -> Tuple[str, Dict[str, str]]:
+        raise NotImplementedError
+
+    def parse(self, ticker: str, payload: Dict[str, Any]) -> pd.DataFrame:
+        raise NotImplementedError
+
+class YahooChartAdapter(ProviderAdapter):
+    """
+    Public Yahoo Finance chart API.
+    Example: https://query1.finance.yahoo.com/v8/finance/chart/AAPL?range=5y&interval=1d
+    """
+    def __init__(self, range_: str = "2y", interval: str = "1d"):
+        super().__init__(ProviderConfig(
+            name="yahoo",
+            base_url="https://query1.finance.yahoo.com/v8/finance/chart",
+            concurrency=8,
+            rpm=None,
+            timeout_s=15.0,
+            headers={"User-Agent": "Mozilla/5.0"}
+        ))
+        self.range_ = range_
+        self.interval = interval
+
+    def build_url_and_params(self, ticker: str) -> Tuple[str, Dict[str, str]]:
+        url = f"{self.cfg.base_url}/{ticker}"
+        params = {"range": self.range_, "interval": self.interval}
+        return url, params
+
+    def parse(self, ticker: str, payload: Dict[str, Any]) -> pd.DataFrame:
+        result = payload.get("chart", {}).get("result")
+        if not result:
+            return pd.DataFrame(columns=["ticker","date","open","high","low","close","volume","provider"])
+        r = result[0]
+        ts = r.get("timestamp", [])
+        indicators = r.get("indicators", {})
+        quote = indicators.get("quote", [{}])[0]
+        o = quote.get("open", [])
+        h = quote.get("high", [])
+        l = quote.get("low", [])
+        c = quote.get("close", [])
+        v = quote.get("volume", [])
+        # Convert unix epoch to UTC pandas datetime
+        if ts:
+            idx = pd.to_datetime(pd.Series(ts, dtype="float64"), unit="s", utc=True)
+            df = pd.DataFrame({
+                "ticker": ticker,
+                "date": idx,
+                "open": pd.Series(o, dtype="float64"),
+                "high": pd.Series(h, dtype="float64"),
+                "low":  pd.Series(l, dtype="float64"),
+                "close":pd.Series(c, dtype="float64"),
+                "volume": pd.Series(v, dtype="float64"),
+            })
+            df["provider"] = self.cfg.name
+            df = df.dropna(subset=["close"])  # drop empty rows
+            return df
+        return pd.DataFrame(columns=["ticker","date","open","high","low","close","volume","provider"])
+
+class AlphaVantageDailyAdjAdapter(ProviderAdapter):
+    """
+    Alpha Vantage TIME_SERIES_DAILY_ADJUSTED
+    Free tier is 5 req/min and 500/day. Provide api_key.
+    """
+    def __init__(self, api_key: str):
+        super().__init__(ProviderConfig(
+            name="alpha_vantage",
+            base_url="https://www.alphavantage.co/query",
+            concurrency=1,      # stay conservative with AV free tier
+            rpm=5,              # 5 req/min
+            timeout_s=20.0,
+        ))
+        self.api_key = api_key
+
+    def build_url_and_params(self, ticker: str) -> Tuple[str, Dict[str, str]]:
+        params = {
+            "function": "TIME_SERIES_DAILY_ADJUSTED",
+            "symbol": ticker,
+            "outputsize": "full",
+            "apikey": self.api_key
+        }
+        return self.cfg.base_url, params
+
+    def parse(self, ticker: str, payload: Dict[str, Any]) -> pd.DataFrame:
+        key = "Time Series (Daily)"
+        if key not in payload:
+            return pd.DataFrame(columns=["ticker","date","open","high","low","close","volume","provider"])
+        ts = payload[key]
+        # ts is dict of date -> fields
+        df = pd.DataFrame.from_dict(ts, orient="index")
+        df.index.name = "date"
+        df = df.rename(columns={
+            "1. open":"open","2. high":"high","3. low":"low","4. close":"close","6. volume":"volume","5. adjusted close":"adj_close"
+        })
+        df = df[["open","high","low","close","volume"]].astype(float)
+        df.reset_index(inplace=True)
+        # AlphaVantage dates are in local naive date strings (YYYY-MM-DD). Convert to UTC midnight.
+        df["date"] = pd.to_datetime(df["date"], utc=True)
+        df["ticker"] = ticker
+        df["provider"] = self.cfg.name
         return df
 
-    def _handle_missing(self, s: pd.Series) -> pd.Series:
-        if self.config.missing_strategy == "ffill_bfill":
-            return s.ffill().bfill()
-        elif self.config.missing_strategy == "interpolate_time":
-            return s.interpolate(method="time").ffill().bfill()
-        elif self.config.missing_strategy == "none":
-            return s
-        else:
-            raise ValueError(f"Unknown missing strategy: {self.config.missing_strategy}")
+# ---------- Async Fetch Core ----------
 
-    def _remove_outliers_series(self, s: pd.Series) -> pd.Series:
-        method = self.config.outlier_strategy
-        if method == "none":
-            return s
+@dataclass
+class FetchResult:
+    ticker: str
+    provider: str
+    df: Optional[pd.DataFrame]
+    error: Optional[str] = None
+    status: Optional[int] = None
 
-        x = s.astype(float).copy()
-        if x.dropna().empty:
-            return x
+class RateLimiter:
+    """Token bucket per minute; simple and robust for small client-side rate limits."""
+    def __init__(self, rpm: Optional[int]):
+        self.rpm = rpm or 10**9
+        self.tokens = self.rpm
+        self.last = time.monotonic()
 
-        if method == "iqr":
-            q1 = x.quantile(0.25)
-            q3 = x.quantile(0.75)
-            iqr = q3 - q1
-            k = self.config.outlier_threshold
-            lower, upper = q1 - k * iqr, q3 + k * iqr
-            mask = (x < lower) | (x > upper)
+    async def acquire(self):
+        if self.rpm >= 10**8:
+            return  # unlimited
+        while True:
+            now = time.monotonic()
+            # refill per second
+            elapsed = now - self.last
+            self.last = now
+            self.tokens = min(self.rpm, self.tokens + elapsed * (self.rpm/60.0))
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return
+            # sleep just enough to get ~1 token
+            await asyncio.sleep(max(0.05, 60.0/self.rpm/2))
 
-        elif method == "mad":
-            median = x.median()
-            mad = (np.abs(x - median)).median()
-            if mad == 0:
-                return x
-            score = 0.6745 * (x - median) / mad
-            mask = np.abs(score) > self.config.outlier_threshold
+class ConcurrentPriceFetcher:
+    def __init__(self, adapters: List[ProviderAdapter], per_request_timeout: Optional[float] = None):
+        self.adapters = adapters
+        self.per_request_timeout = per_request_timeout
+        # Per-provider semaphores and rate limiters
+        self._sems: Dict[str, asyncio.Semaphore] = {
+            a.cfg.name: asyncio.Semaphore(a.cfg.concurrency) for a in adapters
+        }
+        self._limiters: Dict[str, RateLimiter] = {
+            a.cfg.name: RateLimiter(a.cfg.rpm) for a in adapters
+        }
 
-        elif method == "zscore":
-            mean = x.mean()
-            std = x.std(ddof=0)
-            if std == 0:
-                return x
-            z = (x - mean) / std
-            mask = np.abs(z) > self.config.outlier_threshold
-        else:
-            raise ValueError(f"Unknown outlier strategy: {method}")
+    async def _fetch_one(
+        self, session: aiohttp.ClientSession, adapter: ProviderAdapter, ticker: str,
+        max_retries: int = 3, backoff_base: float = 0.6
+    ) -> FetchResult:
+        url, params = adapter.build_url_and_params(ticker)
+        sem = self._sems[adapter.cfg.name]
+        limiter = self._limiters[adapter.cfg.name]
 
-        # Winsorize extreme points to nearest non-outlier boundary
-        if mask.any():
-            non_outliers = x[~mask]
-            lo, hi = non_outliers.min(), non_outliers.max()
-            x[mask & x.notna()] = np.clip(x[mask], lo, hi)
-        return x
+        attempt = 0
+        while True:
+            attempt += 1
+            await limiter.acquire()
+            async with sem:
+                try:
+                    timeout = aiohttp.ClientTimeout(total=self.per_request_timeout or adapter.cfg.timeout_s)
+                    async with session.get(url, params=params, headers=adapter.cfg.headers, timeout=timeout) as resp:
+                        status = resp.status
+                        if status >= 500:
+                            raise aiohttp.ClientResponseError(request_info=resp.request_info, history=(), status=status)
+                        payload = await resp.json(content_type=None)
+                        # Provider-specific error signals
+                        if adapter.cfg.name == "alpha_vantage" and "Note" in payload:
+                            # Throttled; wait a bit more
+                            await asyncio.sleep(12)
+                            raise RuntimeError("AlphaVantage throttle note: " + payload.get("Note", ""))
+                        df = adapter.parse(ticker, payload)
+                        return FetchResult(ticker=ticker, provider=adapter.cfg.name, df=df, status=status)
+                except Exception as e:
+                    if attempt <= max_retries:
+                        # exponential backoff with jitter
+                        sleep_s = (backoff_base ** attempt) + random.uniform(0, 0.25)
+                        await asyncio.sleep(sleep_s)
+                        continue
+                    return FetchResult(ticker=ticker, provider=adapter.cfg.name, df=None, error=str(e))
 
-    def _fit_normalizer(self, s: pd.Series) -> None:
-        if self.config.normalize_strategy == "none":
-            self.norm_params_.clear()
-            return
-        x = s.dropna()
-        if x.empty:
-            self.norm_params_.clear()
-            return
-        if self.config.normalize_strategy == "zscore":
-            self.norm_params_ = {"mean": float(x.mean()), "std": float(x.std(ddof=0))}
-        elif self.config.normalize_strategy == "minmax":
-            self.norm_params_ = {"min": float(x.min()), "max": float(x.max())}
-        elif self.config.normalize_strategy == "robust":
-            self.norm_params_ = {"q1": float(x.quantile(0.25)), "q3": float(x.quantile(0.75))}
-        else:
-            raise ValueError(f"Unknown normalize strategy: {self.config.normalize_strategy}")
+    async def fetch_many_async(
+        self, tickers: Iterable[str], providers: Optional[List[str]] = None
+    ) -> List[FetchResult]:
+        chosen = [a for a in self.adapters if (providers is None or a.cfg.name in providers)]
+        conn = aiohttp.TCPConnector(limit=32, ttl_dns_cache=300)
+        async with aiohttp.ClientSession(connector=conn) as session:
+            tasks = []
+            for adapter in chosen:
+                for t in tickers:
+                    tasks.append(self._fetch_one(session, adapter, t))
+            return await asyncio.gather(*tasks)
 
-    def _apply_normalizer(self, s: pd.Series) -> pd.Series:
-        if not self.norm_params_ or self.config.normalize_strategy == "none":
-            return s
-        if self.config.normalize_strategy == "zscore":
-            mean, std = self.norm_params_["mean"], self.norm_params_["std"]
-            std = std if std != 0 else 1.0
-            return (s - mean) / std
-        elif self.config.normalize_strategy == "minmax":
-            mn, mx = self.norm_params_["min"], self.norm_params_["max"]
-            rng = (mx - mn) if (mx - mn) != 0 else 1.0
-            return (s - mn) / rng
-        elif self.config.normalize_strategy == "robust":
-            q1, q3 = self.norm_params_["q1"], self.norm_params_["q3"]
-            iqr = (q3 - q1) if (q3 - q1) != 0 else 1.0
-            return (s - q1) / iqr
-        else:
-            return s
+    def fetch_many(
+        self, tickers: Iterable[str], providers: Optional[List[str]] = None
+    ) -> List[FetchResult]:
+        return asyncio.run(self.fetch_many_async(tickers, providers))
 
-    def fit(self, df: pd.DataFrame) -> "FinancePreprocessor":
-        df = self._coerce_datetime_index(df)
-        s = df[self.config.price_col].copy()
-        s = self._handle_missing(s)
-        s = self._remove_outliers_series(s)
+# ---------- Utilities to combine results ----------
 
-        if self.config.train_end is not None:
-            s_fit = s.loc[: self.config.train_end]
-        else:
-            s_fit = s
-        self._fit_normalizer(s_fit)
-        self.fitted_ = True
-        return self
+def combine_results_to_long(results: List[FetchResult]) -> pd.DataFrame:
+    frames = []
+    for r in results:
+        if r.df is not None and not r.df.empty:
+            frames.append(r.df)
+    if not frames:
+        return pd.DataFrame(columns=["ticker","date","open","high","low","close","volume","provider"])
+    df = pd.concat(frames, ignore_index=True)
+    # Ensure sorted and proper dtypes
+    if not pd.api.types.is_datetime64_any_dtype(df["date"]):
+        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values(["ticker","provider","date"])
+    return df
 
-    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        if not self.fitted_:
-            raise RuntimeError("Call fit() before transform().")
-        df = self._coerce_datetime_index(df)
-        out = df.copy()
-        s = out[self.config.price_col].copy()
+def pivot_to_wide(df_long: pd.DataFrame, field: str = "close") -> pd.DataFrame:
+    """
+    Wide matrix: index=date, columns=MultiIndex[(provider, ticker)] with selected field.
+    """
+    cols_needed = {"date","ticker","provider",field}
+    missing = cols_needed - set(df_long.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    wide = df_long.pivot_table(index="date", columns=["provider","ticker"], values=field, aggfunc="last").sort_index()
+    return wide
 
-        s = self._handle_missing(s)
-        s = self._remove_outliers_series(s)
-        s_norm = self._apply_normalizer(s)
+# ---------- Example usage with your FinancePreprocessor ----------
 
-        out[self.config.price_col + "_clean"] = s
-        out[self.config.price_col + "_norm"] = s_norm
-        out["ret_1d"] = out[self.config.price_col + "_clean"].pct_change()
-        out["logret_1d"] = np.log(out[self.config.price_col + "_clean"]).diff()
-        return out
+if __name__ == "__main__":
+    # 1) Configure providers
+    yahoo = YahooChartAdapter(range_="1y", interval="1d")
+    # For Alpha Vantage, pass your key; comment out if not available.
+    # av = AlphaVantageDailyAdjAdapter(api_key="YOUR_ALPHA_VANTAGE_KEY")
 
-    def fit_transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        return self.fit(df).transform(df)
+    fetcher = ConcurrentPriceFetcher(adapters=[yahoo])  # or [yahoo, av]
+
+    tickers = ["AAPL", "MSFT", "NVDA"]
+
+    results = fetcher.fetch_many(tickers, providers=None)
+    # Inspect errors, if any
+    for r in results:
+        if r.error:
+            print(f"[{r.provider}] {r.ticker} -> ERROR: {r.error}")
+
+    df_long = combine_results_to_long(results)
+    print("Long shape:", df_long.shape, df_long.head())
+
+    # 2) Get a clean closing-price panel and preprocess per ticker
+    close_wide = pivot_to_wide(df_long, field="close")
+
+    # Example: preprocess a single (provider, ticker) series with your FinancePreprocessor
+    from dataclasses import asdict
+
+    from typing import Optional
+    # Suppose we choose Yahoo/AAPL column
+    target_col = ("yahoo", "AAPL")
+    if target_col in close_wide.columns:
+        tmp = close_wide[[target_col]].rename(columns={target_col: "close"}).reset_index().rename(columns={"date":"date"})
+        # Use your preprocessor
+        pp_cfg = PreprocessConfig(
+            date_col="date",
+            price_col="close",
+            index_utc=True,
+            missing_strategy="ffill_bfill",
+            outlier_strategy="iqr",
+            outlier_threshold=3.0,
+            normalize_strategy="zscore",
+            train_end=None
+        )
+        pp = FinancePreprocessor(pp_cfg)
+        out = pp.fit_transform(tmp)
+        print("Preprocessed sample:")
+        print(out.tail())
